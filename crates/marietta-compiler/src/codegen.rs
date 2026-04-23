@@ -209,6 +209,12 @@ fn codegen_module<M: Module>(
         }
     }
 
+    // Build struct layout map: struct_name → field_count.
+    // (For now, all fields are 8 bytes each; field offset = field_index * 8)
+    let struct_field_count: HashMap<String, usize> = ir.structs.iter()
+        .map(|s| (s.name.clone(), s.fields.len()))
+        .collect();
+
     // ── Pass 2: compile each function body. ───────────────────────────────
     let mut func_ctx = FunctionBuilderContext::new();
     for fn_ir in &ir.functions {
@@ -222,7 +228,7 @@ fn codegen_module<M: Module>(
             ctx.func.signature.returns.push(AbiParam::new(t));
         }
 
-        compile_fn(fn_ir, &func_ids, &fn_sigs, &vtable_fn_names, module, &mut ctx.func, &mut func_ctx, diags);
+        compile_fn(fn_ir, &func_ids, &fn_sigs, &vtable_fn_names, &struct_field_count, module, &mut ctx.func, &mut func_ctx, diags);
 
         if let Err(e) = module.define_function(func_id, &mut ctx) {
             diags.push(CodegenDiagnostic { message: format!("define '{}': {e}", fn_ir.name) });
@@ -238,14 +244,15 @@ fn codegen_module<M: Module>(
 // ---------------------------------------------------------------------------
 
 fn compile_fn<M: Module>(
-    fn_ir:            &FnIr<'_>,
-    func_ids:         &HashMap<String, FuncId>,
-    fn_sigs:          &HashMap<String, (Vec<IrType>, IrType)>,
-    vtable_fn_names:  &HashMap<(String, usize), String>,
-    module:           &mut M,
-    cl_func:          &mut Function,
-    func_ctx:         &mut FunctionBuilderContext,
-    diags:            &mut Vec<CodegenDiagnostic>,
+    fn_ir:               &FnIr<'_>,
+    func_ids:            &HashMap<String, FuncId>,
+    fn_sigs:             &HashMap<String, (Vec<IrType>, IrType)>,
+    vtable_fn_names:     &HashMap<(String, usize), String>,
+    struct_field_count:  &HashMap<String, usize>,
+    module:              &mut M,
+    cl_func:             &mut Function,
+    func_ctx:            &mut FunctionBuilderContext,
+    diags:               &mut Vec<CodegenDiagnostic>,
 ) {
     if fn_ir.blocks.is_empty() { return; }
 
@@ -331,7 +338,7 @@ fn compile_fn<M: Module>(
         for inst in &bb.insts {
             translate_inst(
                 &inst.kind, &mut b, &mut val_map, &var_map,
-                func_ids, fn_sigs, vtable_fn_names, module, diags,
+                func_ids, fn_sigs, vtable_fn_names, struct_field_count, module, diags,
             );
         }
 
@@ -405,15 +412,16 @@ fn collect_val_types(fn_ir: &FnIr<'_>) -> HashMap<ValueId, IrType> {
 
 #[allow(clippy::too_many_arguments)]
 fn translate_inst<M: Module>(
-    inst:             &InstKind,
-    b:                &mut FunctionBuilder<'_>,
-    val_map:          &mut HashMap<ValueId, ClValue>,
-    var_map:          &HashMap<ValueId, Variable>,
-    func_ids:         &HashMap<String, FuncId>,
-    fn_sigs:          &HashMap<String, (Vec<IrType>, IrType)>,
-    vtable_fn_names:  &HashMap<(String, usize), String>,
-    module:           &mut M,
-    diags:            &mut Vec<CodegenDiagnostic>,
+    inst:                &InstKind,
+    b:                   &mut FunctionBuilder<'_>,
+    val_map:             &mut HashMap<ValueId, ClValue>,
+    var_map:             &HashMap<ValueId, Variable>,
+    func_ids:            &HashMap<String, FuncId>,
+    fn_sigs:             &HashMap<String, (Vec<IrType>, IrType)>,
+    vtable_fn_names:     &HashMap<(String, usize), String>,
+    struct_field_count:  &HashMap<String, usize>,
+    module:              &mut M,
+    diags:               &mut Vec<CodegenDiagnostic>,
 ) {
     match inst {
         // Alloc: the Variable was pre-declared; nothing to emit at this site.
@@ -576,20 +584,28 @@ fn translate_inst<M: Module>(
             }
         }
 
-        // GetField: placeholder — field layout is resolved in a later pass.
+        // GetField: Load a field from a struct.
+        // Field byte offset = field_index * 8 (all fields are 8 bytes).
         InstKind::GetField { dst, obj, field_idx } => {
-            diags.push(CodegenDiagnostic {
-                message: format!("GetField {obj}.{field_idx} — layout pass pending"),
-            });
-            let zero = b.ins().iconst(cl::I64, 0);
-            val_map.insert(*dst, zero);
+            if let Some(&obj_ptr) = val_map.get(obj) {
+                use cranelift_codegen::ir::MemFlags;
+                let offset = (*field_idx as i32) * 8;
+                let val = b.ins().load(cl::I64, MemFlags::trusted(), obj_ptr, offset);
+                val_map.insert(*dst, val);
+            } else {
+                let zero = b.ins().iconst(cl::I64, 0);
+                val_map.insert(*dst, zero);
+            }
         }
 
-        // SetField: placeholder.
-        InstKind::SetField { obj, field_idx, .. } => {
-            diags.push(CodegenDiagnostic {
-                message: format!("SetField {obj}.{field_idx} — layout pass pending"),
-            });
+        // SetField: Store a field into a struct.
+        // Field byte offset = field_index * 8 (all fields are 8 bytes).
+        InstKind::SetField { obj, field_idx, val: val_id } => {
+            if let (Some(&obj_ptr), Some(&val)) = (val_map.get(obj), val_map.get(val_id)) {
+                use cranelift_codegen::ir::MemFlags;
+                let offset = (*field_idx as i32) * 8;
+                b.ins().store(MemFlags::trusted(), val, obj_ptr, offset);
+            }
         }
 
         // Copy.

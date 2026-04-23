@@ -95,6 +95,11 @@ pub enum ExprKind<'src> {
     },
     /// `await expr`
     Await(Box<Expr<'src>>),
+    /// Struct initialization: `StructName { field: value, … }`
+    StructInit {
+        type_name: &'src str,
+        fields: Vec<(&'src str, Expr<'src>)>,
+    },
     /// `value if condition else alt`
     IfExpr {
         condition: Box<Expr<'src>>,

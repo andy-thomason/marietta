@@ -283,6 +283,15 @@ impl<'src> Resolver<'src> {
                 }
             }
 
+            ExprKind::StructInit { type_name, fields } => {
+                // Resolve the struct type name
+                self.resolve_name(expr.src, type_name);
+                // Walk each field initialization expression
+                for (_, value) in fields {
+                    self.walk_expr(value);
+                }
+            }
+
             // Literals and errors carry no names.
             ExprKind::IntLiteral(_) | ExprKind::FloatLiteral(_)
             | ExprKind::StringLiteral(_) | ExprKind::BoolLiteral(_)

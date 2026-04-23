@@ -253,6 +253,17 @@ pub struct FnIr<'src> {
 // Module IR
 // ---------------------------------------------------------------------------
 
+/// Struct layout information for code generation.
+///
+/// For now, assume all fields are I64 (8 bytes each).  This is a simplification;
+/// proper layout requires better type resolution integration.
+#[derive(Debug, Clone)]
+pub struct IrStruct {
+    pub name: String,
+    /// Field names in order.
+    pub fields: Vec<String>,
+}
+
 /// One vtable emitted for an `impl Trait for Type` block.
 ///
 /// The vtable name is `{Type}__{Trait}__vtable`.
@@ -270,6 +281,8 @@ pub struct IrVtable {
 #[derive(Debug)]
 pub struct IrModule<'src> {
     pub functions: Vec<FnIr<'src>>,
+    /// Struct layout information for code generation.
+    pub structs: Vec<IrStruct>,
     /// One vtable per `impl Trait for Type` block.
     pub vtables: Vec<IrVtable>,
     pub diagnostics: Vec<IrDiagnostic<'src>>,
@@ -390,7 +403,19 @@ pub fn lower<'src>(
         }
     }
 
-    IrModule { functions, vtables, diagnostics: lowerer.diagnostics }
+    // Collect all struct definitions.
+    let mut structs = Vec::new();
+    for item in &module.items {
+        if let ItemKind::StructDef(sd) = &item.kind {
+            let fields = sd.fields.iter().map(|f| f.name.to_string()).collect();
+            structs.push(IrStruct {
+                name: sd.name.to_string(),
+                fields,
+            });
+        }
+    }
+
+    IrModule { functions, structs, vtables, diagnostics: lowerer.diagnostics }
 }
 
 // ---------------------------------------------------------------------------
@@ -1033,6 +1058,26 @@ impl<'src, 'ir> Lowerer<'src, 'ir> {
                     message: "expression kind not yet lowered to IR",
                 });
                 b.fresh()
+            }
+
+            ExprKind::StructInit { type_name: _, fields } => {
+                // Allocate space for the struct (all structs are opaque Ptr in IR).
+                let struct_ptr = b.fresh();
+                b.emit(expr.src, InstKind::Alloc { dst: struct_ptr, ty: IrType::Ptr });
+
+                // For each field, lower its value expression and emit a SetField.
+                // Field index is determined by position in the struct definition.
+                // TODO: Once struct layout is finalized, use actual field indices.
+                for (field_idx, (_, value)) in fields.iter().enumerate() {
+                    let val = self.lower_expr(value, b);
+                    b.emit(expr.src, InstKind::SetField {
+                        obj: struct_ptr,
+                        field_idx: field_idx as u32,
+                        val,
+                    });
+                }
+
+                struct_ptr
             }
 
             ExprKind::StringLiteral(_) => {

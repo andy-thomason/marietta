@@ -728,6 +728,29 @@ impl<'src, 'res> TypeChecker<'src, 'res> {
                 self.store.intern(Type::MultiSlice { elem: elem_ty, rank })
             }
 
+            ExprKind::StructInit { type_name, fields } => {
+                // Look up the struct type by name.
+                // The type_name should have been resolved by resolve.rs.
+                let use_id = self.node_id(expr.src);
+                if let Some(&type_decl_id) = self.resolutions.get(&use_id) {
+                    // The struct's type should be registered under this ID.
+                    if let Some(struct_ty) = self.lookup_decl(type_decl_id) {
+                        // Walk each field value to infer its type.
+                        // TODO: Once struct layout is implemented, check that
+                        // each field matches the struct definition's type.
+                        for (_, value) in fields {
+                            let _ = self.walk_expr(value);
+                        }
+                        return struct_ty;
+                    }
+                }
+                // Type not found — return error and walk field exprs to avoid cascading.
+                for (_, value) in fields {
+                    let _ = self.walk_expr(value);
+                }
+                self.store.intern(Type::Error)
+            }
+
             ExprKind::Error(_) => self.store.intern(Type::Error),
         }
     }

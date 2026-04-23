@@ -291,6 +291,7 @@ impl<'src> Parser<'src> {
                 Token::Punctuation("(")                   => (30, 0),
                 Token::Punctuation("[")                   => (30, 0),
                 Token::Punctuation(".")                   => (30, 0),
+                Token::Punctuation("{")                   => (30, 0),
                 _ => break,
             };
 
@@ -338,6 +339,33 @@ impl<'src> Parser<'src> {
                     let attr = self.expect_ident().unwrap_or("");
                     let src = self.src_from(start);
                     lhs = Expr { src, kind: ExprKind::Attr { obj: Box::new(lhs), attr } };
+                }
+
+                // Struct initialization `TypeName { field: value, … }`
+                Token::Punctuation("{") => {
+                    // Only allow struct init if LHS is a simple name
+                    if let ExprKind::Name(type_name) = lhs.kind {
+                        self.advance(); // consume '{'
+                        let fields = self.parse_struct_init_fields();
+                        self.expect_punct("}");
+                        let src = self.src_from(start);
+                        lhs = Expr {
+                            src,
+                            kind: ExprKind::StructInit { type_name, fields },
+                        };
+                    } else {
+                        self.diagnostics.push(Diagnostic {
+                            src: lhs.src,
+                            message: "struct initialization can only be used with a struct type name",
+                        });
+                        self.advance(); // consume '{'
+                        while !matches!(self.peek(), Token::Punctuation("}") | Token::Eof) {
+                            self.advance();
+                        }
+                        if matches!(self.peek(), Token::Punctuation("}")) {
+                            self.advance();
+                        }
+                    }
                 }
 
                 // Binary operator
@@ -502,6 +530,21 @@ impl<'src> Parser<'src> {
             if matches!(self.peek(), Token::Punctuation(",")) { self.advance(); }
         }
         (args, kwargs)
+    }
+
+    fn parse_struct_init_fields(&mut self) -> Vec<(&'src str, Expr<'src>)> {
+        let mut fields = Vec::new();
+        while !matches!(self.peek(), Token::Punctuation("}") | Token::Eof) {
+            let field_name = match self.expect_ident() {
+                Some(n) => n,
+                None => break,
+            };
+            self.expect_punct(":");
+            let value = self.parse_expr(0);
+            fields.push((field_name, value));
+            if matches!(self.peek(), Token::Punctuation(",")) { self.advance(); }
+        }
+        fields
     }
 
     fn parse_lambda_params(&mut self) -> Vec<Param<'src>> {

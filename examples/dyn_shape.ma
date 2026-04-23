@@ -1,13 +1,16 @@
-# dyn_shape.ma — dynamic dispatch through a trait object (dyn Trait).
+# dyn_shape.ma — dynamic dispatch through a trait object (dyn Trait) with struct allocation.
 #
-# This example demonstrates Marietta's trait system.  Each `impl Trait for Type`
-# block teaches the compiler to:
+# This example demonstrates Marietta's trait system AND struct initialization syntax.
+# Each `impl Trait for Type` block teaches the compiler to:
 #   1. Mangle the method names: `Circle__area`, `Square__area` etc.
 #   2. Emit a vtable entry: `Circle__Shape__vtable = [&Circle__area, &Circle__perimeter]`
 #
 # A `dyn Shape` parameter is a fat pointer — a 16-byte stack block:
 #   offset 0: data_ptr   (pointer to the concrete struct data)
 #   offset 8: vtable_ptr (pointer to the matching vtable)
+#
+# Struct allocation uses the syntax `Circle { radius: 3 }` to initialize structs.
+# This allocates space for the struct and initializes each field.
 #
 # Calling `s.area()` on a `dyn Shape` compiles to:
 #   data_ptr   = *(fat_ptr + 0)
@@ -73,30 +76,21 @@ def total(s: dyn Shape) -> u64:
     return s.area() + s.perimeter()
 
 # ---------------------------------------------------------------------------
-# 5.  main
-#
-#     Direct concrete calls work today (static dispatch via mangled names).
-#     Passing a concrete struct *as* a dyn Shape requires fat-pointer
-#     construction, which will be wired up when struct-allocation syntax is
-#     added.  The `total` function above already compiles with the correct
-#     VtableCall IR; only the caller-side coercion is pending.
+# 5.  main — struct initialization and dynamic dispatch
 # ---------------------------------------------------------------------------
 
 def main():
-    # These call the mangled concrete implementations directly.
-    var c: Circle
-    c.radius = 3
+    # Struct initialization with the new `Circle { ... }` syntax.
+    var c: Circle = Circle { radius: 3 }
     var c_area: u64 = Circle__area(c)        # static dispatch: r*r = 9
     var c_peri: u64 = Circle__perimeter(c)   # static dispatch: r*4 = 12
 
-    var sq: Square
-    sq.side = 4
+    var sq: Square = Square { side: 4 }
     var sq_area: u64 = Square__area(sq)      # static dispatch: s*s = 16
     var sq_peri: u64 = Square__perimeter(sq) # static dispatch: s*4 = 16
 
-    # Future: once struct-allocation and fat-pointer coercion are in place,
-    # these will compile and dispatch through the vtable:
-    #   var result_c:  u64 = total(c)
-    #   var result_sq: u64 = total(sq)
+    # Dynamic dispatch — the compiler generates vtable lookups here:
+    var result_c:  u64 = total(c)            # dispatches through Circle vtable
+    var result_sq: u64 = total(sq)           # dispatches through Square vtable
 
     pass
