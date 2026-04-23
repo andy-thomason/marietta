@@ -1,4 +1,4 @@
-/// The Emmy AST.
+/// The Marietta AST.
 ///
 /// Every node carries two source slices borrowed from the original source `&str`:
 ///

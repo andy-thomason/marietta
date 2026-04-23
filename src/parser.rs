@@ -1,4 +1,4 @@
-/// Emmy parser: recursive-descent with a Pratt expression parser.
+/// Marietta parser: recursive-descent with a Pratt expression parser.
 ///
 /// The parser never panics.  On unexpected input it emits an error node,
 /// skips to a synchronisation point (next `Newline` or `Dedent`), and
@@ -1057,7 +1057,7 @@ mod tests {
 
     #[test]
     fn let_decl() {
-        let m = module("let name: String = \"Emmy\"\n");
+        let m = module("let name: String = \"Marietta\"\n");
         assert!(matches!(
             &m.items[0].kind,
             ItemKind::Stmt(Stmt { kind: StmtKind::LetDecl { name: "name", .. }, .. })

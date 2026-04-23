@@ -1,4 +1,4 @@
-/// Async / coroutine transform for the Emmy compiler.
+/// Async / coroutine transform for the Marietta compiler.
 ///
 /// This pass analyses every `async def` in the module and produces an
 /// [`AsyncMachine`] description for each one.  Code generation (step 9) uses

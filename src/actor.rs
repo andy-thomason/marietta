@@ -1,4 +1,4 @@
-/// Actor model analysis pass for the Emmy compiler.
+/// Actor model analysis pass for the Marietta compiler.
 ///
 /// This pass walks every `actor` declaration in the module and produces an
 /// [`ActorAnalysis`] for each one.  Code generation (step 9) uses these

@@ -1,4 +1,4 @@
-/// Three-address IR and lowering pass for the Emmy compiler.
+/// Three-address IR and lowering pass for the Marietta compiler.
 ///
 /// This module defines a simple SSA-flavoured IR with basic blocks and provides
 /// a lowering pass that translates the typed AST into IR.
@@ -20,7 +20,7 @@
 ///
 /// # Wide integers
 ///
-/// Emmy supports integers up to 2048 bits wide.  Any type wider than 64 bits
+/// Marietta supports integers up to 2048 bits wide.  Any type wider than 64 bits
 /// is represented in the IR as [`IrType::WideInt`] and annotated with its limb
 /// count (`(bits + 63) / 64` `u64` limbs).  Arithmetic on wide values uses the
 /// same [`InstKind::BinOp`] instruction; code generation (step 9) expands each
@@ -154,12 +154,16 @@ pub struct Instruction<'src> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum InstKind {
-    /// `dst = lhs op rhs`
-    BinOp { op: IrBinOp, dst: ValueId, lhs: ValueId, rhs: ValueId },
+    /// `dst = lhs op rhs` — `ty` is the operand type (used to select signed vs
+    /// unsigned and integer vs float instructions during code generation).
+    BinOp { op: IrBinOp, dst: ValueId, lhs: ValueId, rhs: ValueId, ty: IrType },
     /// `dst = op operand`
     UnaryOp { op: IrUnaryOp, dst: ValueId, operand: ValueId },
     /// `[dst =] func(args…)` — `dst` is `None` for void calls.
+    /// Used for indirect / unresolved calls; prefer [`InstKind::DirectCall`].
     Call { dst: Option<ValueId>, func: ValueId, args: Vec<ValueId> },
+    /// Direct call to a named function in the same module.
+    DirectCall { dst: Option<ValueId>, func_name: String, args: Vec<ValueId> },
     /// `dst = alloca(ty)` — allocate a stack slot for a mutable variable.
     Alloc { dst: ValueId, ty: IrType },
     /// `dst = *ptr`
@@ -267,12 +271,17 @@ pub fn lower<'src>(
         .collect();
 
     // For each Fn-typed node, extract the return type so lower_fn can look it up.
+    // An unresolved (Error) return type means no annotation and no return statement → void.
     let fn_ret_types: HashMap<NodeId, IrType> = infer_result
         .types
         .iter()
         .filter_map(|(nid, tid)| {
             if let Type::Fn { ret, .. } = infer_result.store.resolve(*tid) {
-                Some((*nid, ir_type_of(&infer_result.store.resolve(ret))))
+                let ir_ret = match infer_result.store.resolve(ret) {
+                    Type::None_ | Type::Error => IrType::Void,
+                    t => ir_type_of(&t),
+                };
+                Some((*nid, ir_ret))
             } else {
                 None
             }
@@ -321,6 +330,9 @@ struct FnBuilder<'src> {
     current: usize,
     /// Maps variable names to their alloca `ValueId` (the pointer).
     var_map: HashMap<&'src str, ValueId>,
+    /// Maps variable names to their [`IrType`] — needed for augmented assigns
+    /// to select the correct arithmetic instruction (e.g. `udiv` vs `sdiv`).
+    var_types: HashMap<&'src str, IrType>,
     /// Target block for `break` statements, if any.
     break_target: Option<BlockId>,
     /// Target block for `continue` statements, if any.
@@ -339,6 +351,7 @@ impl<'src> FnBuilder<'src> {
             blocks: vec![entry],
             current: 0,
             var_map: HashMap::new(),
+            var_types: HashMap::new(),
             break_target: None,
             continue_target: None,
         }
@@ -431,9 +444,10 @@ impl<'src, 'ir> Lowerer<'src, 'ir> {
 
             // Alloca for the param so it can be re-assigned.
             let alloca = b.fresh();
-            b.emit(p.src, InstKind::Alloc { dst: alloca, ty });
+            b.emit(p.src, InstKind::Alloc { dst: alloca, ty: ty.clone() });
             b.emit(p.src, InstKind::Store { ptr: alloca, val: param_val });
             b.var_map.insert(p.name, alloca);
+            b.var_types.insert(p.name, ty);
         }
 
         // 2. Pre-allocate slots for all declared locals (conservative; avoids
@@ -443,17 +457,10 @@ impl<'src, 'ir> Lowerer<'src, 'ir> {
             if !b.var_map.contains_key(name) {
                 let ty = self.type_of(local_src);
                 let alloca = b.fresh();
-                b.emit(local_src, InstKind::Alloc { dst: alloca, ty });
+                b.emit(local_src, InstKind::Alloc { dst: alloca, ty: ty.clone() });
                 b.var_map.insert(name, alloca);
+                b.var_types.insert(name, ty);
             }
-        }
-
-        // 3. Lower the function body.
-        self.lower_stmts(&func.body, &mut b);
-
-        // 4. Ensure every block ends with a terminator.
-        if !b.is_terminated() {
-            b.current_block_mut().terminator = Terminator::Return(None);
         }
 
         // Return type is stored inside the Fn type under the function's src NodeId.
@@ -461,6 +468,22 @@ impl<'src, 'ir> Lowerer<'src, 'ir> {
         let fn_ptr = func.src.as_ptr() as usize;
         let fn_nid = NodeId(fn_ptr.saturating_sub(base));
         let ret_ty = self.fn_ret_types.get(&fn_nid).cloned().unwrap_or(IrType::Void);
+
+        // 3. Lower the function body.
+        self.lower_stmts(&func.body, &mut b);
+
+        // 4. Ensure every unterminated block has a terminator.
+        // For void functions a fall-through is a clean return.  For non-void
+        // functions an unterminated block is unreachable dead code (all control
+        // paths already returned); leave it as Unreachable so codegen emits a
+        // trap rather than a type-incorrect empty return.
+        if !b.is_terminated() {
+            b.current_block_mut().terminator = if ret_ty == IrType::Void {
+                Terminator::Return(None)
+            } else {
+                Terminator::Unreachable
+            };
+        }
 
         FnIr {
             src: func.src,
@@ -562,6 +585,9 @@ impl<'src, 'ir> Lowerer<'src, 'ir> {
                         val
                     } else {
                         // Augmented: load current, apply binop, store result.
+                        // Look up the variable's declared type so we can emit
+                        // the correct signed/unsigned/float operation.
+                        let ty = b.var_types.get(name).cloned().unwrap_or(IrType::I64);
                         let cur = b.fresh();
                         b.emit(src, InstKind::Load { dst: cur, ptr });
                         let dst = b.fresh();
@@ -570,6 +596,7 @@ impl<'src, 'ir> Lowerer<'src, 'ir> {
                             dst,
                             lhs: cur,
                             rhs: val,
+                            ty,
                         });
                         dst
                     };
@@ -752,11 +779,17 @@ impl<'src, 'ir> Lowerer<'src, 'ir> {
                 let lhs = self.lower_expr(left, b);
                 let rhs = self.lower_expr(right, b);
                 let dst = b.fresh();
+                // Operand type drives signed/unsigned and int/float selection.
+                let ty = match self.type_of(left.src) {
+                    IrType::Void => self.type_of(expr.src),
+                    t => t,
+                };
                 b.emit(expr.src, InstKind::BinOp {
                     op: ast_binop_to_ir(op),
                     dst,
                     lhs,
                     rhs,
+                    ty,
                 });
                 dst
             }
@@ -773,13 +806,27 @@ impl<'src, 'ir> Lowerer<'src, 'ir> {
             }
 
             ExprKind::Call { func, args, kwargs: _ } => {
-                let fval = self.lower_expr(func, b);
                 let arg_vals: Vec<ValueId> = args.iter()
                     .map(|a| self.lower_expr(a, b))
                     .collect();
                 let ty  = self.type_of(expr.src);
                 let dst = if ty == IrType::Void { None } else { Some(b.fresh()) };
-                b.emit(expr.src, InstKind::Call { dst, func: fval, args: arg_vals });
+
+                // Emit a direct call when the callee is a plain name; indirect
+                // otherwise.  The `fval` for a name load is still computed so
+                // that the Load instruction appears in the IR (it is dead but
+                // harmless), keeping all Name expressions consistently lowered.
+                if let ExprKind::Name(name) = &func.kind {
+                    b.emit(expr.src, InstKind::DirectCall {
+                        dst,
+                        func_name: name.to_string(),
+                        args: arg_vals,
+                    });
+                } else {
+                    let fval = self.lower_expr(func, b);
+                    b.emit(expr.src, InstKind::Call { dst, func: fval, args: arg_vals });
+                }
+
                 // Return a value even for void calls (callers may ignore it).
                 dst.unwrap_or_else(|| b.fresh())
             }
@@ -845,6 +892,7 @@ impl<'src, 'ir> Lowerer<'src, 'ir> {
                     dst: ptr,
                     lhs: base,
                     rhs: idx,
+                    ty: IrType::Ptr,
                 });
                 let dst = b.fresh();
                 b.emit(expr.src, InstKind::Load { dst, ptr });
@@ -1130,8 +1178,8 @@ impl fmt::Display for ConstVal {
 impl fmt::Display for InstKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            InstKind::BinOp { op, dst, lhs, rhs } =>
-                write!(f, "{dst} = {op} {lhs}, {rhs}"),
+            InstKind::BinOp { op, dst, lhs, rhs, ty } =>
+                write!(f, "{dst} = {op}.{ty} {lhs}, {rhs}"),
             InstKind::UnaryOp { op, dst, operand } =>
                 write!(f, "{dst} = {op} {operand}"),
             InstKind::Call { dst, func, args } => {
@@ -1142,6 +1190,16 @@ impl fmt::Display for InstKind {
                 match dst {
                     Some(d) => write!(f, "{d} = call {func}({arg_list})"),
                     None    => write!(f, "call {func}({arg_list})"),
+                }
+            }
+            InstKind::DirectCall { dst, func_name, args } => {
+                let arg_list = args.iter()
+                    .map(|a| a.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                match dst {
+                    Some(d) => write!(f, "{d} = call @{func_name}({arg_list})"),
+                    None    => write!(f, "call @{func_name}({arg_list})"),
                 }
             }
             InstKind::Alloc { dst, ty }            => write!(f, "{dst} = alloca {ty}"),
@@ -1400,7 +1458,13 @@ mod tests {
         let m = run("def f():\n    print(42)\n");
         let f = find_fn(&m, "f");
         let insts = all_insts(f);
-        assert!(insts.iter().any(|k| matches!(k, InstKind::Call { .. })));
+        // Named calls are lowered to DirectCall; the generic Call variant is
+        // only emitted for indirect / first-class function values.
+        assert!(
+            insts.iter().any(|k| matches!(k, InstKind::DirectCall { .. }
+                                            | InstKind::Call { .. })),
+            "expected a Call or DirectCall instruction"
+        );
     }
 
     #[test]
@@ -1442,7 +1506,7 @@ bb0:
   store %3 <- %2
   %4 = load %1
   %5 = load %3
-  %6 = add %4, %5
+  %6 = add.u64 %4, %5
   ret %6
 ";
         assert_eq!(format!("{f}"), expected);
@@ -1453,7 +1517,7 @@ bb0:
         let m = run("def count():\n    var i: u64 = 0\n    while i < 10:\n        i += 1\n");
         let f = find_fn(&m, "count");
         let expected = "\
-fn count() -> ptr:
+fn count() -> void:
 bb0:
   %0 = alloca u64
   %1 = const u64 0
@@ -1462,12 +1526,12 @@ bb0:
 bb1:
   %2 = load %0
   %3 = const u64 10
-  %4 = lt %2, %3
+  %4 = lt.bool %2, %3
   br %4, bb2, bb3
 bb2:
   %5 = const u64 1
   %6 = load %0
-  %7 = add %6, %5
+  %7 = add.u64 %6, %5
   store %0 <- %7
   jump bb1
 bb3:
@@ -1487,10 +1551,10 @@ bb0:
   store %1 <- %0
   %2 = load %1
   %3 = const i64 0
-  %4 = lt %2, %3
+  %4 = lt.bool %2, %3
   br %4, bb2, bb3
 bb1:
-  ret
+  unreachable
 bb2:
   %5 = load %1
   %6 = neg %5
@@ -1509,7 +1573,7 @@ bb3:
         );
         let f = find_fn(&m, "increment");
         let expected = "\
-fn increment(ptr) -> ptr:
+fn increment(ptr) -> void:
 bb0:
   %1 = alloca ptr
   store %1 <- %0
@@ -1556,7 +1620,7 @@ bb0:
   store %5 <- %4
   %6 = load %1
   %7 = load %3
-  %8 = lt %6, %7
+  %8 = lt.bool %6, %7
   br %8, bb1, bb2
 bb1:
   %9 = load %3
@@ -1564,7 +1628,7 @@ bb1:
 bb2:
   %10 = load %1
   %11 = load %5
-  %12 = gt %10, %11
+  %12 = gt.bool %10, %11
   br %12, bb4, bb5
 bb3:
   %16 = phi [bb1: %9], [bb6: %15]

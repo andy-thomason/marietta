@@ -1,4 +1,4 @@
-/// Type inference pass for the Emmy compiler.
+/// Type inference pass for the Marietta compiler.
 ///
 /// Performs Hindley-Milner-style unification over the AST.  Every expression
 /// and declaration is assigned a [`TypeId`] — a handle into the [`TypeStore`]
@@ -33,7 +33,7 @@ pub struct TypeId(pub u32);
 // Type
 // ---------------------------------------------------------------------------
 
-/// A resolved Emmy type.
+/// A resolved Marietta type.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type {
     /// Any-width integer: `u8`, `i64`, `u256`, …

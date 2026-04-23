@@ -1,6 +1,6 @@
-# The Emmy programming language
+# The Marietta programming language
 
-Emmy is python-like but compiled to concrete values. It uses Python-like syntax
+Marietta is python-like but compiled to concrete values. It uses Python-like syntax
 but leans more on Rust for implementation. The objective is to make actor models
 with channels and RPC calls very easy to implement.
 
@@ -30,7 +30,7 @@ def variables():
     a = 1
     var x: u8 = 10
     var sum: u8 = x + x
-    let name: String = "Emmy"
+    let name: String = "Marietta"
     # name = "Python" # Error: Cannot mutate let value
     print(sum)
 ```
@@ -49,7 +49,7 @@ Multiplying slices with %*% applies tensor multiply rules yielding an array. Bin
 
 * Structs are similar to mojo, but we have separate impl blocks as in rust for methods.
 
-* Write some examples of Emmy for testing. A 256 bit fibanocci, a matrix multiply. We may revise the syntax down the line.
+* Write some examples of Marietta for testing. A 256 bit fibanocci, a matrix multiply. We may revise the syntax down the line.
 
 ---
 
@@ -99,7 +99,7 @@ Multiplying slices with %*% applies tensor multiply rules yielding an array. Bin
   to a synchronisation point (next newline or `Dedent`), and continues.
 - Collect all `ErrorNode`s in a `Vec<Diagnostic>` stored on the parser; return
   the (possibly partial) tree together with the diagnostics.
-- Write integration tests that round-trip small Emmy snippets and check the
+- Write integration tests that round-trip small Marietta snippets and check the
   resulting AST shape.
 
 ### 4. Name Resolution (`src/resolve.rs`)
@@ -169,8 +169,8 @@ Multiplying slices with %*% applies tensor multiply rules yielding an array. Bin
   `cranelift-module`). No LLVM dependency required.
 - Each IR basic block is translated to a Cranelift `Block`; values are SSA
   `cranelift_codegen::ir::Value`s.
-- Use `cranelift_jit::JITModule` for immediate execution (`emmy run`) and
-  `cranelift_object::ObjectModule` to emit native object files (`emmy build`).
+- Use `cranelift_jit::JITModule` for immediate execution (`marietta run`) and
+  `cranelift_object::ObjectModule` to emit native object files (`marietta build`).
 - Integer types up to 64 bits map directly to Cranelift's `I8`/`I16`/`I32`/`I64`
   types. Wider integers (up to 2048 bits) are lowered to arrays of `I64` limbs
   with helper functions generated inline (add-with-carry, shift, etc.).
@@ -183,7 +183,7 @@ Multiplying slices with %*% applies tensor multiply rules yielding an array. Bin
 
 ### 10. Runtime (`src/runtime/`)
 
-- A minimal Rust runtime crate linked into every Emmy executable.
+- A minimal Rust runtime crate linked into every Marietta executable.
 - Implements a work-stealing task scheduler for async coroutines and actors.
 - Provides `channel::<T>()` returning `(Sender<T>, Receiver<T>)` backed by
   a lock-free MPSC queue.
@@ -200,7 +200,7 @@ Multiplying slices with %*% applies tensor multiply rules yielding an array. Bin
 
 ### 12. Driver (`src/main.rs`)
 
-- Parse CLI arguments: `emmy build <file>`, `emmy run <file>`, `emmy check <file>`.
+- Parse CLI arguments: `marietta build <file>`, `marietta run <file>`, `marietta check <file>`.
 - Run the pipeline: lex → parse → resolve → type-check → async-transform →
   actor-lower → IR → codegen → link.
 - `check` stops after type-checking and prints diagnostics.
@@ -208,11 +208,11 @@ Multiplying slices with %*% applies tensor multiply rules yielding an array. Bin
 
 ### 13. Test Suite
 
-- `tests/` directory with `.emmy` source files and expected `.stdout` / `.stderr`
+- `tests/` directory with `.marietta` source files and expected `.stdout` / `.stderr`
   snapshots.
-- `tests/fib256.emmy` — 256-bit Fibonacci using `u256`.
-- `tests/matmul.emmy` — matrix multiply over `f32`.
-- `tests/actors.emmy` — a counter actor demonstrating RPC.
-- `tests/channels.emmy` — producer / consumer with a bounded channel.
+- `tests/fib256.marietta` — 256-bit Fibonacci using `u256`.
+- `tests/matmul.marietta` — matrix multiply over `f32`.
+- `tests/actors.marietta` — a counter actor demonstrating RPC.
+- `tests/channels.marietta` — producer / consumer with a bounded channel.
 - Run via `cargo test`; each test compiles and executes the file and diffs output.
 
