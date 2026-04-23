@@ -1,3 +1,4 @@
+mod actor;
 mod ast;
 mod async_transform;
 mod lexer;
@@ -62,6 +63,17 @@ fn compile(file: &PathBuf) -> bool {
 
     if !async_result.machines.is_empty() {
         eprintln!("info: {} async state machine(s) found", async_result.machines.len());
+    }
+
+    let actor_result = actor::analyse(&parse_result.module);
+
+    for diag in &actor_result.diagnostics {
+        eprintln!("actor warning: {}", diag.message);
+        // Actor diagnostics are warnings, not hard errors.
+    }
+
+    if !actor_result.analyses.is_empty() {
+        eprintln!("info: {} actor(s) found", actor_result.analyses.len());
     }
 
     !had_error
