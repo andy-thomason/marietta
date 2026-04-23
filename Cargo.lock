@@ -430,6 +430,13 @@ name = "marietta"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "marietta-compiler",
+]
+
+[[package]]
+name = "marietta-compiler"
+version = "0.1.0"
+dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
  "cranelift-jit",

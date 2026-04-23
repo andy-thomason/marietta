@@ -1,0 +1,8 @@
+[package]
+name    = "marietta"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+marietta-compiler = { path = "../marietta-compiler" }
+clap = { version = "4", features = ["derive"] }
