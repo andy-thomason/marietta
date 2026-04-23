@@ -85,6 +85,9 @@ fn to_cl_type(ty: &IrType) -> Option<cranelift_codegen::ir::Type> {
         IrType::F64  => Some(cl::F64),
         IrType::Bool => Some(cl::I8),
         IrType::Ptr  => Some(cl::I64), // 64-bit target
+        // dyn Trait: fat pointer (data_ptr, vtable_ptr) — passed as a pointer to
+        // a two-word block, so the ABI type is the same as a regular pointer.
+        IrType::Dyn { .. } => Some(cl::I64),
         IrType::Void => None,
     }
 }
@@ -172,6 +175,9 @@ fn codegen_module<M: Module>(
     let mut func_ids: HashMap<String, FuncId> = HashMap::new();
 
     // ── Pass 1: declare every function so forward calls resolve. ──────────
+    // Also build a map from function name → (params, ret) for indirect-call
+    // signature reconstruction (needed for VtableCall).
+    let mut fn_sigs: HashMap<String, (Vec<IrType>, IrType)> = HashMap::new();
     for fn_ir in &ir.functions {
         let mut sig = module.make_signature();
         for (_, ty) in &fn_ir.params {
@@ -179,18 +185,34 @@ fn codegen_module<M: Module>(
         }
         if let Some(t) = to_cl_type(&fn_ir.ret_ty) { sig.returns.push(AbiParam::new(t)); }
 
-        match module.declare_function(fn_ir.name, Linkage::Export, &sig) {
-            Ok(id)  => { func_ids.insert(fn_ir.name.to_owned(), id); }
+        match module.declare_function(&fn_ir.name, Linkage::Export, &sig) {
+            Ok(id)  => { func_ids.insert(fn_ir.name.clone(), id); }
             Err(e)  => diags.push(CodegenDiagnostic {
                 message: format!("declare '{}': {e}", fn_ir.name),
             }),
+        }
+        fn_sigs.insert(
+            fn_ir.name.clone(),
+            (fn_ir.params.iter().map(|(_, t)| t.clone()).collect(), fn_ir.ret_ty.clone()),
+        );
+    }
+
+    // Build (trait_name, method_idx) → concrete function name for VtableCall.
+    // We use the first registered vtable per trait since all impls share the
+    // same method signature for a given slot index.
+    let mut vtable_fn_names: HashMap<(String, usize), String> = HashMap::new();
+    for vtable in &ir.vtables {
+        for (idx, fn_name) in vtable.methods.iter().enumerate() {
+            vtable_fn_names
+                .entry((vtable.trait_name.clone(), idx))
+                .or_insert_with(|| fn_name.clone());
         }
     }
 
     // ── Pass 2: compile each function body. ───────────────────────────────
     let mut func_ctx = FunctionBuilderContext::new();
     for fn_ir in &ir.functions {
-        let Some(&func_id) = func_ids.get(fn_ir.name) else { continue };
+        let Some(&func_id) = func_ids.get(&fn_ir.name) else { continue };
 
         let mut ctx = module.make_context();
         for (_, ty) in &fn_ir.params {
@@ -200,7 +222,7 @@ fn codegen_module<M: Module>(
             ctx.func.signature.returns.push(AbiParam::new(t));
         }
 
-        compile_fn(fn_ir, &func_ids, module, &mut ctx.func, &mut func_ctx, diags);
+        compile_fn(fn_ir, &func_ids, &fn_sigs, &vtable_fn_names, module, &mut ctx.func, &mut func_ctx, diags);
 
         if let Err(e) = module.define_function(func_id, &mut ctx) {
             diags.push(CodegenDiagnostic { message: format!("define '{}': {e}", fn_ir.name) });
@@ -216,12 +238,14 @@ fn codegen_module<M: Module>(
 // ---------------------------------------------------------------------------
 
 fn compile_fn<M: Module>(
-    fn_ir:    &FnIr<'_>,
-    func_ids: &HashMap<String, FuncId>,
-    module:   &mut M,
-    cl_func:  &mut Function,
-    func_ctx: &mut FunctionBuilderContext,
-    diags:    &mut Vec<CodegenDiagnostic>,
+    fn_ir:            &FnIr<'_>,
+    func_ids:         &HashMap<String, FuncId>,
+    fn_sigs:          &HashMap<String, (Vec<IrType>, IrType)>,
+    vtable_fn_names:  &HashMap<(String, usize), String>,
+    module:           &mut M,
+    cl_func:          &mut Function,
+    func_ctx:         &mut FunctionBuilderContext,
+    diags:            &mut Vec<CodegenDiagnostic>,
 ) {
     if fn_ir.blocks.is_empty() { return; }
 
@@ -307,7 +331,7 @@ fn compile_fn<M: Module>(
         for inst in &bb.insts {
             translate_inst(
                 &inst.kind, &mut b, &mut val_map, &var_map,
-                func_ids, module, diags,
+                func_ids, fn_sigs, vtable_fn_names, module, diags,
             );
         }
 
@@ -381,13 +405,15 @@ fn collect_val_types(fn_ir: &FnIr<'_>) -> HashMap<ValueId, IrType> {
 
 #[allow(clippy::too_many_arguments)]
 fn translate_inst<M: Module>(
-    inst:      &InstKind,
-    b:         &mut FunctionBuilder<'_>,
-    val_map:   &mut HashMap<ValueId, ClValue>,
-    var_map:   &HashMap<ValueId, Variable>,
-    func_ids:  &HashMap<String, FuncId>,
-    module:    &mut M,
-    diags:     &mut Vec<CodegenDiagnostic>,
+    inst:             &InstKind,
+    b:                &mut FunctionBuilder<'_>,
+    val_map:          &mut HashMap<ValueId, ClValue>,
+    var_map:          &HashMap<ValueId, Variable>,
+    func_ids:         &HashMap<String, FuncId>,
+    fn_sigs:          &HashMap<String, (Vec<IrType>, IrType)>,
+    vtable_fn_names:  &HashMap<(String, usize), String>,
+    module:           &mut M,
+    diags:            &mut Vec<CodegenDiagnostic>,
 ) {
     match inst {
         // Alloc: the Variable was pre-declared; nothing to emit at this site.
@@ -489,6 +515,66 @@ fn translate_inst<M: Module>(
 
         // Phi: handled at block entry via phi_vars / use_var.
         InstKind::Phi { .. } => {}
+
+        // VtableCall: dynamic dispatch through a fat pointer's vtable.
+        //
+        // Memory layout expected at runtime:
+        //   fat_ptr → [data_ptr: I64, vtable_ptr: I64]
+        //   vtable_ptr → [fn0: I64, fn1: I64, ...]
+        //
+        // We load the function pointer from vtable slot `method_idx` and call
+        // it with `data_ptr` prepended to the user-supplied `args`.
+        InstKind::VtableCall { dst, fat_ptr, trait_name, method_idx, args } => {
+            use cranelift_codegen::ir::MemFlags;
+
+            let Some(&fat_ptr_val) = val_map.get(fat_ptr) else { return };
+
+            // Load data_ptr and vtable_ptr from the fat pointer block.
+            let data_ptr   = b.ins().load(cl::I64, MemFlags::trusted(), fat_ptr_val, 0);
+            let vtable_ptr = b.ins().load(cl::I64, MemFlags::trusted(), fat_ptr_val, 8);
+
+            // Load the function pointer at the correct vtable slot.
+            let slot_offset = (*method_idx as i32) * 8;
+            let fn_ptr = b.ins().load(cl::I64, MemFlags::trusted(), vtable_ptr, slot_offset);
+
+            // Build the indirect-call signature from the first registered impl
+            // for this trait method.  All impls must share the same signature.
+            let key = (trait_name.clone(), *method_idx);
+            let (param_irtypes, ret_irtype) = if let Some(fn_name) = vtable_fn_names.get(&key) {
+                fn_sigs.get(fn_name)
+                    .map(|(p, r)| (p.clone(), r.clone()))
+                    .unwrap_or_else(|| (vec![], IrType::Void))
+            } else {
+                (vec![], IrType::Void)
+            };
+
+            let mut call_sig = module.make_signature();
+            // First param: data_ptr (the concrete struct pointer)
+            call_sig.params.push(AbiParam::new(cl::I64));
+            // Remaining params: skip index 0 ('self') from the vtable function's signature
+            for ty in param_irtypes.iter().skip(1) {
+                if let Some(t) = to_cl_type(ty) { call_sig.params.push(AbiParam::new(t)); }
+            }
+            if let Some(t) = to_cl_type(&ret_irtype) { call_sig.returns.push(AbiParam::new(t)); }
+            let call_sig_ref = b.import_signature(call_sig);
+
+            // Build argument list: data_ptr first, then the user args.
+            let mut all_args: Vec<ClValue> = vec![data_ptr];
+            for a in args {
+                if let Some(&v) = val_map.get(a) { all_args.push(v); }
+            }
+
+            let call = b.ins().call_indirect(call_sig_ref, fn_ptr, &all_args);
+            if let Some(dst_id) = dst {
+                let results = b.inst_results(call).to_vec();
+                if let Some(&result) = results.first() {
+                    val_map.insert(*dst_id, result);
+                } else {
+                    let zero = b.ins().iconst(cl::I64, 0);
+                    val_map.insert(*dst_id, zero);
+                }
+            }
+        }
 
         // GetField: placeholder — field layout is resolved in a later pass.
         InstKind::GetField { dst, obj, field_idx } => {

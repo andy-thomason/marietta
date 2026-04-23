@@ -67,6 +67,11 @@ pub enum IrType {
     /// Opaque pointer (target pointer size) — used for aggregates, slices,
     /// strings, function references, and channels.
     Ptr,
+    /// A `dyn TraitName` fat pointer: (data_ptr, vtable_ptr) stored as two
+    /// consecutive pointer-sized words on the caller's stack.  In Cranelift
+    /// terms this is passed / stored as a single `I64` that holds the address
+    /// of the two-word block.
+    Dyn { trait_name: String },
     /// No value produced (void return, `None` literal).
     Void,
 }
@@ -101,6 +106,7 @@ pub fn ir_type_of(ty: &Type) -> IrType {
         Type::None_  => IrType::Void,
         Type::IntLit   => IrType::I64,   // default: i64
         Type::FloatLit => IrType::F64,   // default: f64
+        Type::Dyn(name) => IrType::Dyn { trait_name: name.clone() },
         // Aggregate / pointer-like types — pointer-sized in the IR.
         _ => IrType::Ptr,
     }
@@ -164,6 +170,15 @@ pub enum InstKind {
     Call { dst: Option<ValueId>, func: ValueId, args: Vec<ValueId> },
     /// Direct call to a named function in the same module.
     DirectCall { dst: Option<ValueId>, func_name: String, args: Vec<ValueId> },
+    /// Dynamic dispatch through a vtable.
+    ///
+    /// `fat_ptr` is an SSA value holding the address of a two-word block
+    /// `[data_ptr: Ptr, vtable_ptr: Ptr]` on the caller's stack.
+    /// `trait_name` identifies the trait so codegen can look up the method
+    /// signature from the registered vtables.
+    /// `method_idx` is the 0-based index of the method in the trait's vtable.
+    /// The data pointer is automatically prepended to `args` before the call.
+    VtableCall { dst: Option<ValueId>, fat_ptr: ValueId, trait_name: String, method_idx: usize, args: Vec<ValueId> },
     /// `dst = alloca(ty)` — allocate a stack slot for a mutable variable.
     Alloc { dst: ValueId, ty: IrType },
     /// `dst = *ptr`
@@ -218,8 +233,13 @@ pub struct BasicBlock<'src> {
 pub struct FnIr<'src> {
     /// Source text of the function definition (for debug info).
     pub src: &'src str,
-    /// Name as declared in source.
-    pub name: &'src str,
+    /// Fully-qualified (potentially mangled) name used in the module.
+    ///
+    /// For free functions and `impl` block methods this is the same as the
+    /// source name.  For `impl Trait for Type` methods the name is mangled
+    /// to `{Type}__{method}` so that multiple impls of the same method name
+    /// do not collide in the module symbol table.
+    pub name: String,
     /// Parameter SSA values and their types.  These are the raw incoming
     /// values; each is immediately stored into its alloca at function entry.
     pub params: Vec<(ValueId, IrType)>,
@@ -233,9 +253,25 @@ pub struct FnIr<'src> {
 // Module IR
 // ---------------------------------------------------------------------------
 
+/// One vtable emitted for an `impl Trait for Type` block.
+///
+/// The vtable name is `{Type}__{Trait}__vtable`.
+/// `methods` lists fully-mangled function names in the same order as the
+/// corresponding `TraitDef::methods` list.
+#[derive(Debug, Clone)]
+pub struct IrVtable {
+    pub vtable_name: String,
+    pub trait_name: String,
+    pub type_name: String,
+    /// Mangled function names in trait-method declaration order.
+    pub methods: Vec<String>,
+}
+
 #[derive(Debug)]
 pub struct IrModule<'src> {
     pub functions: Vec<FnIr<'src>>,
+    /// One vtable per `impl Trait for Type` block.
+    pub vtables: Vec<IrVtable>,
     pub diagnostics: Vec<IrDiagnostic<'src>>,
 }
 
@@ -288,14 +324,29 @@ pub fn lower<'src>(
         })
         .collect();
 
+    // Pre-pass: build vtable method index so dyn call lowering can look up
+    // method indices without needing a mutable borrow of the module later.
+    let mut vtable_method_index: HashMap<(String, String), usize> = HashMap::new();
+    for item in &module.items {
+        if let ItemKind::ImplFor(i) = &item.kind {
+            for (idx, m) in i.methods.iter().enumerate() {
+                vtable_method_index
+                    .entry((i.trait_name.to_string(), m.name.to_string()))
+                    .or_insert(idx);
+            }
+        }
+    }
+
     let mut lowerer = Lowerer {
         source,
         ir_types: &ir_types,
         fn_ret_types: &fn_ret_types,
+        vtable_method_index: &vtable_method_index,
         diagnostics: Vec::new(),
     };
 
     let mut functions = Vec::new();
+    let mut vtables: Vec<IrVtable> = Vec::new();
 
     for item in &module.items {
         match &item.kind {
@@ -308,10 +359,24 @@ pub fn lower<'src>(
                 }
             }
             ItemKind::ImplFor(i) => {
-                // Concrete method bodies compile to regular functions.
+                // Mangle each method name: `{Type}__{method}` to avoid
+                // collisions when multiple types implement the same trait.
+                let mut vtable_methods = Vec::new();
                 for m in &i.methods {
-                    functions.push(lowerer.lower_fn(m));
+                    let mangled = format!("{}__{}" , i.type_name, m.name);
+                    let mut fn_ir = lowerer.lower_fn(m);
+                    fn_ir.name = mangled.clone();
+                    functions.push(fn_ir);
+                    vtable_methods.push(mangled);
                 }
+                // Record the vtable so codegen can construct it.
+                let vtable_name = format!("{}__{}__vtable", i.type_name, i.trait_name);
+                vtables.push(IrVtable {
+                    vtable_name,
+                    trait_name: i.trait_name.to_string(),
+                    type_name:  i.type_name.to_string(),
+                    methods:    vtable_methods,
+                });
             }
             ItemKind::TraitDef(_) => {
                 // Trait defs are signatures only — no IR emitted.
@@ -325,7 +390,7 @@ pub fn lower<'src>(
         }
     }
 
-    IrModule { functions, diagnostics: lowerer.diagnostics }
+    IrModule { functions, vtables, diagnostics: lowerer.diagnostics }
 }
 
 // ---------------------------------------------------------------------------
@@ -420,6 +485,9 @@ struct Lowerer<'src, 'ir> {
     ir_types:     &'ir HashMap<NodeId, IrType>,
     /// Maps function-declaration NodeId → return IrType (extracted from Fn types).
     fn_ret_types: &'ir HashMap<NodeId, IrType>,
+    /// Maps `(trait_name, method_name)` → vtable slot index.
+    /// Populated by `lower()` as it processes `ImplFor` items.
+    vtable_method_index: &'ir HashMap<(String, String), usize>,
     diagnostics:  Vec<IrDiagnostic<'src>>,
 }
 
@@ -496,7 +564,7 @@ impl<'src, 'ir> Lowerer<'src, 'ir> {
 
         FnIr {
             src: func.src,
-            name: func.name,
+            name: func.name.to_string(),
             params,
             ret_ty,
             blocks: b.blocks,
@@ -821,6 +889,32 @@ impl<'src, 'ir> Lowerer<'src, 'ir> {
                 let ty  = self.type_of(expr.src);
                 let dst = if ty == IrType::Void { None } else { Some(b.fresh()) };
 
+                // Dyn call: `receiver.method(args)` where receiver has a Dyn type.
+                // The receiver is a fat pointer; dispatch through its vtable.
+                if let ExprKind::Attr { obj, attr } = &func.kind {
+                    let obj_ty = self.type_of(obj.src);
+                    if let IrType::Dyn { trait_name } = obj_ty {
+                        let key = (trait_name.clone(), attr.to_string());
+                        if let Some(&method_idx) = self.vtable_method_index.get(&key) {
+                            let fat_ptr = self.lower_expr(obj, b);
+                            b.emit(expr.src, InstKind::VtableCall {
+                                dst,
+                                fat_ptr,
+                                trait_name: trait_name.clone(),
+                                method_idx,
+                                args: arg_vals,
+                            });
+                            return dst.unwrap_or_else(|| b.fresh());
+                        } else {
+                            self.diagnostics.push(IrDiagnostic {
+                                src:     expr.src,
+                                message: "method not found in vtable for dyn call",
+                            });
+                            return b.fresh();
+                        }
+                    }
+                }
+
                 // Emit a direct call when the callee is a plain name; indirect
                 // otherwise.  The `fval` for a name load is still computed so
                 // that the Load instruction appears in the IR (it is dead but
@@ -1113,6 +1207,7 @@ impl fmt::Display for IrType {
             IrType::F64  => write!(f, "f64"),
             IrType::Bool => write!(f, "bool"),
             IrType::Ptr  => write!(f, "ptr"),
+            IrType::Dyn { trait_name } => write!(f, "dyn {trait_name}"),
             IrType::Void => write!(f, "void"),
         }
     }
@@ -1209,6 +1304,16 @@ impl fmt::Display for InstKind {
                 match dst {
                     Some(d) => write!(f, "{d} = call @{func_name}({arg_list})"),
                     None    => write!(f, "call @{func_name}({arg_list})"),
+                }
+            }
+            InstKind::VtableCall { dst, fat_ptr, trait_name, method_idx, args } => {
+                let arg_list = args.iter()
+                    .map(|a| a.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                match dst {
+                    Some(d) => write!(f, "{d} = vtable_call {fat_ptr}.{trait_name}[{method_idx}]({arg_list})"),
+                    None    => write!(f, "vtable_call {fat_ptr}.{trait_name}[{method_idx}]({arg_list})"),
                 }
             }
             InstKind::Alloc { dst, ty }            => write!(f, "{dst} = alloca {ty}"),
