@@ -151,6 +151,29 @@ impl<'src> Parser<'src> {
 
     fn parse_type_expr(&mut self) -> TypeExpr<'src> {
         let start = self.current_src();
+
+        // Fixed-size array type `[T; N]`
+        if matches!(self.peek(), Token::Punctuation("[")) {
+            self.advance(); // `[`
+            let elem = self.parse_type_expr();
+            self.expect_punct(";");
+            // Parse the length as an integer literal.
+            let len: u64 = if let Token::IntLiteral(s) = self.peek() {
+                let n = s.trim_end_matches(|c: char| c == '_' || c.is_alphabetic())
+                         .replace('_', "")
+                         .parse().unwrap_or(0);
+                self.advance();
+                n
+            } else {
+                let bad = self.current_src();
+                self.diagnostics.push(Diagnostic { src: bad, message: "expected array length" });
+                0
+            };
+            self.expect_punct("]");
+            let src = self.src_from(start);
+            return TypeExpr { src, kind: TypeExprKind::Array { elem: Box::new(elem), len } };
+        }
+
         let name = match self.peek() {
             Token::Identifier(s) | Token::Keyword(s) => {
                 let s = *s;
@@ -409,7 +432,7 @@ impl<'src> Parser<'src> {
                     first
                 }
             }
-            // List literal
+            // Array / list literal `[a, b, …]`
             Token::Punctuation("[") => {
                 self.advance();
                 let mut elems = Vec::new();
@@ -419,7 +442,23 @@ impl<'src> Parser<'src> {
                 }
                 self.expect_punct("]");
                 let src = self.src_from(start);
-                Expr { src, kind: ExprKind::List(elems) }
+                Expr { src, kind: ExprKind::ArrayLit(elems) }
+            }
+            // Multi-dimensional slice literal `&[start..end, start..end, …]`
+            Token::Punctuation("&") if matches!(self.peek2(), Token::Punctuation("[")) => {
+                self.advance(); // &
+                self.advance(); // [
+                let mut ranges = Vec::new();
+                while !matches!(self.peek(), Token::Punctuation("]") | Token::Eof) {
+                    let range_start = self.parse_expr(0);
+                    self.expect_punct("..");
+                    let range_end = self.parse_expr(0);
+                    ranges.push((range_start, range_end));
+                    if matches!(self.peek(), Token::Punctuation(",")) { self.advance(); }
+                }
+                self.expect_punct("]");
+                let src = self.src_from(start);
+                Expr { src, kind: ExprKind::MultiSliceLit(ranges) }
             }
             _ => {
                 let bad = self.current_src();
@@ -983,7 +1022,7 @@ mod tests {
         let m = module("[1, 2, 3]\n");
         assert!(matches!(
             &m.items[0].kind,
-            ItemKind::Stmt(Stmt { kind: StmtKind::Expr(Expr { kind: ExprKind::List(_), .. }), .. })
+            ItemKind::Stmt(Stmt { kind: StmtKind::Expr(Expr { kind: ExprKind::ArrayLit(_), .. }), .. })
         ));
     }
 
@@ -1201,5 +1240,95 @@ mod tests {
             let stmt_start = stmt.src.as_ptr() as usize;
             assert!(stmt_start >= src_start && stmt_start < src_start + src.len());
         }
+    }
+
+    // ---- MultiSlice literal ------------------------------------------------
+
+    #[test]
+    fn parse_multislice_1d() {
+        let m = module("x = &[10..20]\n");
+        if let ItemKind::Stmt(stmt) = &m.items[0].kind {
+            if let StmtKind::Assign { value, .. } = &stmt.kind {
+                assert!(matches!(&value.kind, ExprKind::MultiSliceLit(r) if r.len() == 1));
+                return;
+            }
+        }
+        panic!("expected MultiSliceLit with 1 range");
+    }
+
+    #[test]
+    fn parse_multislice_2d() {
+        let m = module("x = &[10..20, 30..40]\n");
+        if let ItemKind::Stmt(stmt) = &m.items[0].kind {
+            if let StmtKind::Assign { value, .. } = &stmt.kind {
+                assert!(matches!(&value.kind, ExprKind::MultiSliceLit(r) if r.len() == 2));
+                return;
+            }
+        }
+        panic!("expected MultiSliceLit with 2 ranges");
+    }
+
+    #[test]
+    fn parse_multislice_no_errors() {
+        let r = parse("x = &[10..20, 30..40, 50..60]\n");
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+    }
+
+    // ---- Type suffixes on literals -----------------------------------------
+
+    #[test]
+    fn int_suffix_u8() {
+        let m = module("x = 42_u8\n");
+        if let ItemKind::Stmt(stmt) = &m.items[0].kind {
+            if let StmtKind::Assign { value, .. } = &stmt.kind {
+                assert!(matches!(&value.kind, ExprKind::IntLiteral("42_u8")));
+                return;
+            }
+        }
+        panic!("expected IntLiteral(\"42_u8\")");
+    }
+
+    #[test]
+    fn int_suffix_with_separator() {
+        let m = module("x = 1_000_u32\n");
+        if let ItemKind::Stmt(stmt) = &m.items[0].kind {
+            if let StmtKind::Assign { value, .. } = &stmt.kind {
+                assert!(matches!(&value.kind, ExprKind::IntLiteral("1_000_u32")));
+                return;
+            }
+        }
+        panic!("expected IntLiteral(\"1_000_u32\")");
+    }
+
+    #[test]
+    fn float_suffix_f32() {
+        let m = module("x = 3.14_f32\n");
+        if let ItemKind::Stmt(stmt) = &m.items[0].kind {
+            if let StmtKind::Assign { value, .. } = &stmt.kind {
+                assert!(matches!(&value.kind, ExprKind::FloatLiteral("3.14_f32")));
+                return;
+            }
+        }
+        panic!("expected FloatLiteral(\"3.14_f32\")");
+    }
+
+    // ---- Array literal and type --------------------------------------------
+
+    #[test]
+    fn array_literal_is_arraylit() {
+        let m = module("x = [1_u8, 2, 3]\n");
+        if let ItemKind::Stmt(stmt) = &m.items[0].kind {
+            if let StmtKind::Assign { value, .. } = &stmt.kind {
+                assert!(matches!(&value.kind, ExprKind::ArrayLit(v) if v.len() == 3));
+                return;
+            }
+        }
+        panic!("expected ArrayLit with 3 elements");
+    }
+
+    #[test]
+    fn array_type_annotation_no_errors() {
+        let r = parse("var x: [u8; 10]\n");
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
     }
 }

@@ -251,8 +251,14 @@ impl<'src> Resolver<'src> {
                 self.walk_expr(body);
                 self.pop_scope();
             }
-            ExprKind::Tuple(elems) | ExprKind::List(elems) => {
+            ExprKind::Tuple(elems) | ExprKind::List(elems) | ExprKind::ArrayLit(elems) => {
                 for e in elems { self.walk_expr(e); }
+            }
+            ExprKind::MultiSliceLit(ranges) => {
+                for (lo, hi) in ranges {
+                    self.walk_expr(lo);
+                    self.walk_expr(hi);
+                }
             }
 
             // Literals and errors carry no names.
@@ -277,8 +283,14 @@ impl<'src> Resolver<'src> {
                     self.check_assign_target(name, target.src);
                 }
             }
-            ExprKind::Tuple(elems) | ExprKind::List(elems) => {
+            ExprKind::Tuple(elems) | ExprKind::List(elems) | ExprKind::ArrayLit(elems) => {
                 for e in elems { self.walk_assign_target(e, is_augmented); }
+            }
+            ExprKind::MultiSliceLit(ranges) => {
+                for (lo, hi) in ranges {
+                    self.walk_expr(lo);
+                    self.walk_expr(hi);
+                }
             }
             ExprKind::Attr { obj, .. } => self.walk_expr(obj),
             ExprKind::Index { obj, index } => {

@@ -2,6 +2,7 @@ mod ast;
 mod lexer;
 mod parser;
 mod resolve;
+mod types;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;

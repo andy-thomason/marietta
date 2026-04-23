@@ -30,6 +30,11 @@ pub enum TypeExprKind<'src> {
         base: Box<TypeExpr<'src>>,
         args: Vec<TypeExpr<'src>>,
     },
+    /// A fixed-size array type `[T; N]`.
+    Array {
+        elem: Box<TypeExpr<'src>>,
+        len:  u64,
+    },
     /// A parse error in a type position.
     Error(&'static str),
 }
@@ -103,6 +108,16 @@ pub enum ExprKind<'src> {
     Tuple(Vec<Expr<'src>>),
     /// A list `[a, b, …]`.
     List(Vec<Expr<'src>>),
+    /// A fixed-size array constant `[a, b, …]`.
+    ///
+    /// Produced by `[expr, expr, …]` in expression position. Unlike `List`
+    /// this compiles to a stack-allocated array with a known element count.
+    ArrayLit(Vec<Expr<'src>>),
+    /// A multi-dimensional slice literal `&[start..end, start..end, …]`.
+    ///
+    /// Each element is `(start, end)` corresponding to one dimension's range.
+    /// The number of pairs is the rank.
+    MultiSliceLit(Vec<(Expr<'src>, Expr<'src>)>),
     /// A parse error in expression position.
     Error(&'static str),
 }

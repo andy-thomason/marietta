@@ -243,6 +243,12 @@ impl<'src> Lexer<'src> {
             }
         }
 
+        // Optional type suffix after the closing quote: `"hello"_bytes`, etc.
+        if self.peek() == Some('_') && self.peek2().map_or(false, |c| c.is_alphabetic()) {
+            self.advance(); // `_`
+            self.take_while(|c| c.is_alphanumeric());
+        }
+
         Token::StringLiteral(&self.src[start..self.pos])
     }
 
@@ -280,8 +286,8 @@ impl<'src> Lexer<'src> {
                 self.take_while(|c| c.is_ascii_digit() || c == '_');
                 true
             }
-            (Some('.'), _) if self.peek2().map_or(true, |c| !c.is_alphabetic()) => {
-                // bare `1.` — treat as float
+            (Some('.'), _) if self.peek2().map_or(true, |c| !c.is_alphabetic() && c != '.') => {
+                // bare `1.` — treat as float (but not `1..` which is int + range)
                 self.advance();
                 true
             }
@@ -299,6 +305,21 @@ impl<'src> Lexer<'src> {
         } else {
             is_float
         };
+
+        // Optional type suffix: `_u8`, `_f32`, `_i64`, …
+        // `take_while` above may have consumed a trailing `_`; if the char
+        // just before `self.pos` is `_` and the next char is alphabetic then
+        // the `_` is the start of the suffix rather than a digit separator.
+        if self.pos > start
+            && self.src.as_bytes().get(self.pos - 1) == Some(&b'_')
+            && self.peek().map_or(false, |c| c.is_alphabetic())
+        {
+            self.pos -= 1; // give back the `_`
+        }
+        if self.peek() == Some('_') && self.peek2().map_or(false, |c| c.is_alphabetic()) {
+            self.advance(); // `_`
+            self.take_while(|c| c.is_alphanumeric());
+        }
 
         let slice = &self.src[start..self.pos];
         if is_float {
@@ -344,7 +365,7 @@ impl<'src> Lexer<'src> {
         let len = match two {
             "==" | "!=" | "<=" | ">=" | "**" | "//" | "<<" | ">>" | "->"
             | "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^="
-            | "**=" | "//=" | "<<=" | ">>=" | "::" => 2,
+            | "**=" | "//=" | "<<=" | ">>=" | "::" | ".." => 2,
             _ => {
                 match self.peek() {
                     Some(c @ ('+' | '-' | '*' | '/' | '%' | '&' | '|' | '^'
