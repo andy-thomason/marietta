@@ -266,9 +266,23 @@ pub fn lower<'src>(
         .map(|(nid, tid)| (*nid, ir_type_of(&infer_result.store.resolve(*tid))))
         .collect();
 
+    // For each Fn-typed node, extract the return type so lower_fn can look it up.
+    let fn_ret_types: HashMap<NodeId, IrType> = infer_result
+        .types
+        .iter()
+        .filter_map(|(nid, tid)| {
+            if let Type::Fn { ret, .. } = infer_result.store.resolve(*tid) {
+                Some((*nid, ir_type_of(&infer_result.store.resolve(ret))))
+            } else {
+                None
+            }
+        })
+        .collect();
+
     let mut lowerer = Lowerer {
         source,
         ir_types: &ir_types,
+        fn_ret_types: &fn_ret_types,
         diagnostics: Vec::new(),
     };
 
@@ -380,9 +394,11 @@ impl<'src> FnBuilder<'src> {
 // ---------------------------------------------------------------------------
 
 struct Lowerer<'src, 'ir> {
-    source:      &'src str,
-    ir_types:    &'ir HashMap<NodeId, IrType>,
-    diagnostics: Vec<IrDiagnostic<'src>>,
+    source:       &'src str,
+    ir_types:     &'ir HashMap<NodeId, IrType>,
+    /// Maps function-declaration NodeId → return IrType (extracted from Fn types).
+    fn_ret_types: &'ir HashMap<NodeId, IrType>,
+    diagnostics:  Vec<IrDiagnostic<'src>>,
 }
 
 impl<'src, 'ir> Lowerer<'src, 'ir> {
@@ -404,9 +420,12 @@ impl<'src, 'ir> Lowerer<'src, 'ir> {
         // 1. Emit parameter SSA values and allocas.
         let mut params = Vec::new();
         for p in &func.params {
-            let ty = p.annotation.as_ref()
-                .map(|ann| self.type_of(ann.src))
-                .unwrap_or(IrType::Ptr);
+            // Parameters are stored in the TypeMap under the full param src slice
+            // (e.g. "a: u64"), which is the key used by the type checker's bind().
+            let ty = match self.type_of(p.src) {
+                IrType::Void => IrType::Ptr, // unresolved param — fall back to ptr
+                t => t,
+            };
             let param_val = b.fresh();
             params.push((param_val, ty.clone()));
 
@@ -437,9 +456,11 @@ impl<'src, 'ir> Lowerer<'src, 'ir> {
             b.current_block_mut().terminator = Terminator::Return(None);
         }
 
-        let ret_ty = func.return_type.as_ref()
-            .map(|rt| self.type_of(rt.src))
-            .unwrap_or(IrType::Void);
+        // Return type is stored inside the Fn type under the function's src NodeId.
+        let base = self.source.as_ptr() as usize;
+        let fn_ptr = func.src.as_ptr() as usize;
+        let fn_nid = NodeId(fn_ptr.saturating_sub(base));
+        let ret_ty = self.fn_ret_types.get(&fn_nid).cloned().unwrap_or(IrType::Void);
 
         FnIr {
             src: func.src,
@@ -995,6 +1016,204 @@ fn ast_unop_to_ir(op: &str) -> IrUnaryOp {
 }
 
 // ---------------------------------------------------------------------------
+// Pretty-printer
+// ---------------------------------------------------------------------------
+//
+// Text format (one instruction per line, indented inside blocks):
+//
+//   fn add(u64, u64) -> u64:
+//   bb0:
+//     %0: u64
+//     %1 = alloca u64
+//     store %1 <- %0
+//     %2: u64
+//     %3 = alloca u64
+//     store %3 <- %2
+//     %4 = load %1
+//     %5 = load %3
+//     %6 = add %4, %5
+//     ret %6
+//
+// Block terminators appear as the last line of each block.
+
+use std::fmt;
+
+impl fmt::Display for IrType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IrType::I8   => write!(f, "i8"),
+            IrType::I16  => write!(f, "i16"),
+            IrType::I32  => write!(f, "i32"),
+            IrType::I64  => write!(f, "i64"),
+            IrType::U8   => write!(f, "u8"),
+            IrType::U16  => write!(f, "u16"),
+            IrType::U32  => write!(f, "u32"),
+            IrType::U64  => write!(f, "u64"),
+            IrType::WideInt { bits, signed } => {
+                write!(f, "{}{bits}", if *signed { 'i' } else { 'u' })
+            }
+            IrType::F32  => write!(f, "f32"),
+            IrType::F64  => write!(f, "f64"),
+            IrType::Bool => write!(f, "bool"),
+            IrType::Ptr  => write!(f, "ptr"),
+            IrType::Void => write!(f, "void"),
+        }
+    }
+}
+
+impl fmt::Display for ValueId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "%{}", self.0)
+    }
+}
+
+impl fmt::Display for BlockId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "bb{}", self.0)
+    }
+}
+
+impl fmt::Display for IrBinOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            IrBinOp::Add   => "add",
+            IrBinOp::Sub   => "sub",
+            IrBinOp::Mul   => "mul",
+            IrBinOp::Div   => "div",
+            IrBinOp::Rem   => "rem",
+            IrBinOp::And   => "and",
+            IrBinOp::Or    => "or",
+            IrBinOp::Xor   => "xor",
+            IrBinOp::Shl   => "shl",
+            IrBinOp::Shr   => "shr",
+            IrBinOp::CmpEq => "eq",
+            IrBinOp::CmpNe => "ne",
+            IrBinOp::CmpLt => "lt",
+            IrBinOp::CmpLe => "le",
+            IrBinOp::CmpGt => "gt",
+            IrBinOp::CmpGe => "ge",
+        };
+        write!(f, "{s}")
+    }
+}
+
+impl fmt::Display for IrUnaryOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            IrUnaryOp::Neg    => "neg",
+            IrUnaryOp::Not    => "not",
+            IrUnaryOp::BitNot => "bitnot",
+        };
+        write!(f, "{s}")
+    }
+}
+
+impl fmt::Display for ConstVal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConstVal::Int(n)       => write!(f, "{n}"),
+            ConstVal::WideInt(ls)  => {
+                // Print as 0x<hex>, most-significant limb first.
+                write!(f, "0x")?;
+                for limb in ls.iter().rev() {
+                    write!(f, "{limb:016x}")?;
+                }
+                Ok(())
+            }
+            ConstVal::Float(v)     => write!(f, "{v}"),
+            ConstVal::Bool(b)      => write!(f, "{b}"),
+            ConstVal::None         => write!(f, "none"),
+        }
+    }
+}
+
+impl fmt::Display for InstKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            InstKind::BinOp { op, dst, lhs, rhs } =>
+                write!(f, "{dst} = {op} {lhs}, {rhs}"),
+            InstKind::UnaryOp { op, dst, operand } =>
+                write!(f, "{dst} = {op} {operand}"),
+            InstKind::Call { dst, func, args } => {
+                let arg_list = args.iter()
+                    .map(|a| a.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                match dst {
+                    Some(d) => write!(f, "{d} = call {func}({arg_list})"),
+                    None    => write!(f, "call {func}({arg_list})"),
+                }
+            }
+            InstKind::Alloc { dst, ty }            => write!(f, "{dst} = alloca {ty}"),
+            InstKind::Load  { dst, ptr }            => write!(f, "{dst} = load {ptr}"),
+            InstKind::Store { ptr, val }            => write!(f, "store {ptr} <- {val}"),
+            InstKind::Const { dst, val, ty }        => write!(f, "{dst} = const {ty} {val}"),
+            InstKind::GetField { dst, obj, field_idx } =>
+                write!(f, "{dst} = getfield {obj}.{field_idx}"),
+            InstKind::SetField { obj, field_idx, val } =>
+                write!(f, "setfield {obj}.{field_idx} <- {val}"),
+            InstKind::Copy  { dst, src_val }        => write!(f, "{dst} = copy {src_val}"),
+            InstKind::Phi   { dst, incoming }       => {
+                let pairs = incoming.iter()
+                    .map(|(blk, val)| format!("[{blk}: {val}]"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "{dst} = phi {pairs}")
+            }
+        }
+    }
+}
+
+impl fmt::Display for Terminator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Terminator::Jump(blk)                        => write!(f, "jump {blk}"),
+            Terminator::Branch { cond, then_blk, else_blk } =>
+                write!(f, "br {cond}, {then_blk}, {else_blk}"),
+            Terminator::Return(Some(v))                  => write!(f, "ret {v}"),
+            Terminator::Return(None)                     => write!(f, "ret"),
+            Terminator::Unreachable                      => write!(f, "unreachable"),
+        }
+    }
+}
+
+impl<'src> fmt::Display for BasicBlock<'src> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "{}:", self.id)?;
+        for inst in &self.insts {
+            writeln!(f, "  {}", inst.kind)?;
+        }
+        writeln!(f, "  {}", self.terminator)
+    }
+}
+
+impl<'src> fmt::Display for FnIr<'src> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let param_types = self.params.iter()
+            .map(|(_, ty)| ty.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(f, "fn {}({}) -> {}:", self.name, param_types, self.ret_ty)?;
+        for block in &self.blocks {
+            write!(f, "{block}")?;
+        }
+        Ok(())
+    }
+}
+
+impl<'src> fmt::Display for IrModule<'src> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, func) in self.functions.iter().enumerate() {
+            if i > 0 {
+                writeln!(f)?;
+            }
+            write!(f, "{func}")?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1204,5 +1423,162 @@ mod tests {
     fn no_ir_diagnostics_for_simple_fn() {
         let m = run("def add(a: u64, b: u64) -> u64:\n    return a + b\n");
         assert!(m.diagnostics.is_empty(), "unexpected diagnostics: {:?}", m.diagnostics);
+    }
+
+    // ------------------------------------------------------------------
+    // Pretty-printer snapshot tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn pp_binary_arithmetic() {
+        let m = run("def add(a: u64, b: u64) -> u64:\n    return a + b\n");
+        let f = find_fn(&m, "add");
+        let expected = "\
+fn add(u64, u64) -> u64:
+bb0:
+  %1 = alloca u64
+  store %1 <- %0
+  %3 = alloca u64
+  store %3 <- %2
+  %4 = load %1
+  %5 = load %3
+  %6 = add %4, %5
+  ret %6
+";
+        assert_eq!(format!("{f}"), expected);
+    }
+
+    #[test]
+    fn pp_while_loop() {
+        let m = run("def count():\n    var i: u64 = 0\n    while i < 10:\n        i += 1\n");
+        let f = find_fn(&m, "count");
+        let expected = "\
+fn count() -> ptr:
+bb0:
+  %0 = alloca u64
+  %1 = const u64 0
+  store %0 <- %1
+  jump bb1
+bb1:
+  %2 = load %0
+  %3 = const u64 10
+  %4 = lt %2, %3
+  br %4, bb2, bb3
+bb2:
+  %5 = const u64 1
+  %6 = load %0
+  %7 = add %6, %5
+  store %0 <- %7
+  jump bb1
+bb3:
+  ret
+";
+        assert_eq!(format!("{f}"), expected);
+    }
+
+    #[test]
+    fn pp_if_else() {
+        let m = run("def abs(x: i64) -> i64:\n    if x < 0:\n        return -x\n    else:\n        return x\n");
+        let f = find_fn(&m, "abs");
+        let expected = "\
+fn abs(i64) -> i64:
+bb0:
+  %1 = alloca i64
+  store %1 <- %0
+  %2 = load %1
+  %3 = const i64 0
+  %4 = lt %2, %3
+  br %4, bb2, bb3
+bb1:
+  ret
+bb2:
+  %5 = load %1
+  %6 = neg %5
+  ret %6
+bb3:
+  %7 = load %1
+  ret %7
+";
+        assert_eq!(format!("{f}"), expected);
+    }
+
+    #[test]
+    fn pp_actor_increment() {
+        let m = run(
+            "actor Counter:\n    var count: u64 = 0\n\n    def increment(self):\n        self.count += 1\n\n    def get(self) -> u64:\n        return self.count\n",
+        );
+        let f = find_fn(&m, "increment");
+        let expected = "\
+fn increment(ptr) -> ptr:
+bb0:
+  %1 = alloca ptr
+  store %1 <- %0
+  %2 = const i64 1
+  %3 = load %1
+  setfield %3.0 <- %2
+  ret
+";
+        assert_eq!(format!("{f}"), expected);
+    }
+
+    #[test]
+    fn pp_actor_getter() {
+        let m = run(
+            "actor Counter:\n    var count: u64 = 0\n\n    def increment(self):\n        self.count += 1\n\n    def get(self) -> u64:\n        return self.count\n",
+        );
+        let f = find_fn(&m, "get");
+        let expected = "\
+fn get(ptr) -> u64:
+bb0:
+  %1 = alloca ptr
+  store %1 <- %0
+  %2 = load %1
+  %3 = getfield %2.0
+  ret %3
+";
+        assert_eq!(format!("{f}"), expected);
+    }
+
+    #[test]
+    fn pp_ternary_phi() {
+        let m = run(
+            "def clamp(x: u64, lo: u64, hi: u64) -> u64:\n    return lo if x < lo else hi if x > hi else x\n",
+        );
+        let f = find_fn(&m, "clamp");
+        let expected = "\
+fn clamp(u64, u64, u64) -> u64:
+bb0:
+  %1 = alloca u64
+  store %1 <- %0
+  %3 = alloca u64
+  store %3 <- %2
+  %5 = alloca u64
+  store %5 <- %4
+  %6 = load %1
+  %7 = load %3
+  %8 = lt %6, %7
+  br %8, bb1, bb2
+bb1:
+  %9 = load %3
+  jump bb3
+bb2:
+  %10 = load %1
+  %11 = load %5
+  %12 = gt %10, %11
+  br %12, bb4, bb5
+bb3:
+  %16 = phi [bb1: %9], [bb6: %15]
+  ret %16
+bb4:
+  %13 = load %5
+  jump bb6
+bb5:
+  %14 = load %1
+  jump bb6
+bb6:
+  %15 = phi [bb4: %13], [bb5: %14]
+  jump bb3
+";
+        assert_eq!(format!("{f}"), expected);
     }
 }
